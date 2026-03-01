@@ -316,17 +316,32 @@ def _wait_ready_or_socks(ev: threading.Event, port: int, timeout: float) -> bool
         time.sleep(0.2)
     return False
 
-def _real_ping_via_socks(port: int, timeout: float, host: str, dst_port: int) -> Tuple[int, str]:
+def _real_ping_via_socks(port: int, timeout: float, host: str, dst_port: int,
+                         username: Optional[str] = None, password: Optional[str] = None) -> Tuple[int, str]:
     start = time.monotonic()
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     s.settimeout(timeout)
     try:
         s.connect(("127.0.0.1", int(port)))
 
-        s.sendall(b"\x05\x01\x00")
-        r = s.recv(2)
-        if len(r) != 2 or r[1] != 0x00:
-            return -1, "SOCKS FAIL"
+        if username and password:
+            s.sendall(b"\x05\x01\x02")
+            r = s.recv(2)
+            if len(r) != 2 or r[1] != 0x02:
+                return -1, "SOCKS FAIL"
+            ub = username.encode("utf-8")
+            pb = password.encode("utf-8")
+            if len(ub) > 255 or len(pb) > 255:
+                return -1, "SOCKS AUTH FAIL"
+            s.sendall(b"\x01" + bytes([len(ub)]) + ub + bytes([len(pb)]) + pb)
+            ar = s.recv(2)
+            if len(ar) != 2 or ar[1] != 0x00:
+                return -1, "SOCKS AUTH FAIL"
+        else:
+            s.sendall(b"\x05\x01\x00")
+            r = s.recv(2)
+            if len(r) != 2 or r[1] != 0x00:
+                return -1, "SOCKS FAIL"
 
         hb = host.encode("utf-8", "ignore")
         req = b"\x05\x01\x00\x03" + bytes([len(hb)]) + hb + int(dst_port).to_bytes(2, "big")
@@ -352,14 +367,15 @@ def _real_ping_via_socks(port: int, timeout: float, host: str, dst_port: int) ->
         except Exception:
             pass
 
-def realtest_one(ip: str, domain: str, exe: str, ready_ms: int, timeout_s: float) -> Tuple[str, str]:
+def realtest_one(ip: str, domain: str, exe: str, ready_ms: int, timeout_s: float,
+                 username: Optional[str] = None, password: Optional[str] = None) -> Tuple[str, str]:
     port = _free_port()
     proc = None
     try:
         proc, ev = _start_slipstream(exe, ip, domain, port)
         if not _wait_ready_or_socks(ev, port, max(0.2, ready_ms / 1000.0)):
             return "READY TIMEOUT", "-"
-        ms, st = _real_ping_via_socks(port, timeout_s, "www.google.com", 443)
+        ms, st = _real_ping_via_socks(port, timeout_s, "www.google.com", 443, username, password)
         return st, ("-" if ms < 0 else str(ms))
     except FileNotFoundError:
         return "SLIPSTREAM NOT FOUND", "-"
@@ -573,6 +589,8 @@ def cmd_scan(args: argparse.Namespace) -> int:
     rt_ready = int(args.realtest_ready_ms)
     rt_timeout = float(args.realtest_timeout_s)
     rt_parallel = max(1, int(args.realtest_parallel))
+    rt_username = getattr(args, "socks_username", None) or None
+    rt_password = getattr(args, "socks_password", None) or None
 
     found_end: List[str] = []
     found_seen = set()
@@ -643,7 +661,7 @@ def cmd_scan(args: argparse.Namespace) -> int:
                     time.sleep(0.05)
                 continue
             dash.set_current_realtest(ip)
-            st, ms = realtest_one(ip, domain, rt_exe, rt_ready, rt_timeout)
+            st, ms = realtest_one(ip, domain, rt_exe, rt_ready, rt_timeout, rt_username, rt_password)
             rt_out.put((ip, st, ms))
             dash.set_current_realtest("")
 
@@ -752,7 +770,7 @@ def cmd_scan(args: argparse.Namespace) -> int:
                     dash.set_current_realtest(ip)
                     live.update(dash.render(subtitle()))
 
-                    st, ms_rt = realtest_one(ip, domain, rt_exe, rt_ready, rt_timeout)
+                    st, ms_rt = realtest_one(ip, domain, rt_exe, rt_ready, rt_timeout, rt_username, rt_password)
                     ok_rt = st.endswith(" ms")
                     dash.update_realtest(ip, ms_rt, st, ok_rt)
                     if ok_rt:
@@ -818,6 +836,9 @@ def cmd_realtest(args: argparse.Namespace) -> int:
 
     dash = RichDashboard(total_scan=len(ips), table_keep=500)
 
+    rt_username = getattr(args, "socks_username", None) or None
+    rt_password = getattr(args, "socks_password", None) or None
+
     rt_ok_f = _open_text_out(args.realtest_ok_out) if getattr(args, "realtest_ok_out", None) else None
     rt_ok_fmt = (getattr(args, "realtest_ok_format", "ip") or "ip").lower()
 
@@ -841,7 +862,7 @@ def cmd_realtest(args: argparse.Namespace) -> int:
             dash.set_current_realtest(ip)
             live.update(dash.render(subtitle()))
 
-            st, ms = realtest_one(ip, domain, exe, args.ready_timeout_ms, args.timeout_s)
+            st, ms = realtest_one(ip, domain, exe, args.ready_timeout_ms, args.timeout_s, rt_username, rt_password)
             ok_rt = st.endswith(" ms")
             dash.update_realtest(ip, ms, st, ok_rt)
             if ok_rt:
@@ -891,6 +912,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     s.add_argument("--live-drain-timeout-s", type=float, default=30.0,
                    help="After scan finishes in live mode, wait up to this many seconds for remaining RealPing results.")
+    s.add_argument("--socks-username", default="", help="Username for SOCKS5 authentication during RealPing tests (optional)")
+    s.add_argument("--socks-password", default="", help="Password for SOCKS5 authentication during RealPing tests (optional)")
 
     s.set_defaults(func=cmd_scan)
 
@@ -904,6 +927,8 @@ def build_parser() -> argparse.ArgumentParser:
     r.add_argument("--stdout", action="store_true", help="When --ui is on, also print results to stdout (default: off)")
     r.add_argument("--realtest-ok-out", default="", help="Write RealTest OK results to file")
     r.add_argument("--realtest-ok-format", choices=["ip", "ipms"], default="ip", help="Format for --realtest-ok-out: ip or 'ip ms'")
+    r.add_argument("--socks-username", default="", help="Username for SOCKS5 authentication (optional)")
+    r.add_argument("--socks-password", default="", help="Password for SOCKS5 authentication (optional)")
     r.set_defaults(func=cmd_realtest)
 
     return p
